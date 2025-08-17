@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  bot-ecac-api:
+    build: .
+    container_name: bot_ecac_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
+      - ./certs:/app/certs:ro
+    env_file:
+      - config.env
+    environment:
+      - CERTIFICADO_PATH=/app/certs/HAYLANDER MARTINS CONTABILIDADE LTDA51564549000140.pfx
+    networks:
+      - traefik_network
+    labels:
+      # Traefik labels
+      - "traefik.enable=true"
+      - "traefik.http.routers.bot-ecac.rule=Host(`bot-ecac.seu-dominio.com`)"
+      - "traefik.http.routers.bot-ecac.entrypoints=websecure"
+      - "traefik.http.routers.bot-ecac.tls.certresolver=letsencrypt"
+      - "traefik.http.services.bot-ecac.loadbalancer.server.port=8000"
+      # Health check
+      - "traefik.http.routers.bot-ecac.middlewares=auth@file"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+networks:
+  traefik_network:
+    external: true 
