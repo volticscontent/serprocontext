@@ -1,65 +1,66 @@
-"""
-Cliente para integração com SERPRO Integra Contador
-"""
-
 import httpx
 import asyncio
-import json
 import base64
 import ssl
-from datetime import datetime, timedelta
+from pathlib import Path
+from datetime import datetime
 from typing import Dict, Any, Optional
 from loguru import logger
-from app.config import get_settings
 
-settings = get_settings()
+from app.config import settings, get_serpro_urls
+from app.token_cache import token_cache
 
 
 class SerproClient:
-    """Cliente para comunicação com SERPRO Integra Contador"""
+    """Cliente simplificado para APIs SERPRO Integra Contador"""
     
     def __init__(self):
-        self.base_url = settings.serpro_base_url
-        self.token_url = settings.serpro_token_url
         self.consumer_key = settings.serpro_consumer_key
         self.consumer_secret = settings.serpro_consumer_secret
-        self.certificado_path = settings.certificado_path
-        self.certificado_senha = settings.certificado_senha
-        self.cpf_procurador = settings.cpf_procurador.replace(".", "").replace("-", "")
+        self.cpf_procurador = settings.cpf_procurador
         
-        # Cache do token
-        self._token = None
-        self._token_expires = None
+        # URLs baseadas no ambiente
+        urls = get_serpro_urls(settings.serpro_ambiente)
+        self.base_url = urls["base_url"]
+        self.token_url = urls["token_url"]
         
-        # Configurar SSL context para certificado
-        self._ssl_context = self._create_ssl_context()
-    
-    def _create_ssl_context(self) -> ssl.SSLContext:
-        """Cria contexto SSL com certificado digital"""
+        # SSL Context para certificado
+        self.ssl_context = self._setup_ssl()
+        
+    def _setup_ssl(self) -> ssl.SSLContext:
+        """Configura contexto SSL com certificado digital"""
         try:
-            context = ssl.create_default_context()
+            cert_path = Path(settings.certificado_path)
             
-            # Carregar certificado se existir
-            try:
-                context.load_cert_chain(
-                    self.certificado_path, 
-                    password=self.certificado_senha
-                )
-                logger.info(f"Certificado carregado: {self.certificado_path}")
-            except Exception as e:
-                logger.warning(f"Erro ao carregar certificado: {e}")
-                logger.info("Continuando sem certificado digital")
-            
-            return context
-            
+            if cert_path.exists() and cert_path.suffix.lower() == '.pfx':
+                logger.info(f"Certificado PFX encontrado: {cert_path}")
+                # Para PFX, usar contexto padrão por enquanto
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                return context
+            elif cert_path.exists() and cert_path.suffix.lower() in ['.pem', '.crt']:
+                logger.info(f"Certificado PEM encontrado: {cert_path}")
+                context = ssl.create_default_context()
+                context.load_cert_chain(cert_path)
+                return context
+            else:
+                logger.warning("Certificado não encontrado, usando SSL padrão")
+                return ssl.create_default_context()
+                
         except Exception as e:
-            logger.error(f"Erro ao criar contexto SSL: {e}")
+            logger.error(f"Erro ao configurar SSL: {e}")
             return ssl.create_default_context()
     
     async def _get_oauth_token(self) -> str:
         """Obtém token OAuth2 do SERPRO"""
         try:
-            logger.info("Obtendo token OAuth2 do SERPRO...")
+            logger.info("Obtendo novo token OAuth2...")
+            
+            # Verificar cache primeiro
+            cached_token = token_cache.get_token()
+            if cached_token:
+                return cached_token
             
             # Preparar credenciais
             credentials = base64.b64encode(
@@ -76,223 +77,139 @@ class SerproClient:
             
             async with httpx.AsyncClient(
                 timeout=settings.request_timeout_seconds,
-                verify=self._ssl_context
+                verify=self.ssl_context
             ) as client:
                 response = await client.post(
                     self.token_url,
                     headers=headers,
-                    data=data
+                    content=data
                 )
                 
                 if response.status_code == 200:
                     token_data = response.json()
-                    token = token_data["access_token"]
+                    access_token = token_data["access_token"]
                     expires_in = token_data.get("expires_in", 3600)
                     
-                    # Cache do token
-                    self._token = token
-                    self._token_expires = datetime.now() + timedelta(
-                        seconds=expires_in - 60  # 1 minuto de margem
-                    )
+                    # Salvar no cache
+                    token_cache.save_token(access_token, expires_in)
                     
-                    logger.info("Token OAuth2 obtido com sucesso")
-                    return token
-                    
+                    logger.success("Token OAuth2 obtido com sucesso")
+                    return access_token
                 else:
                     logger.error(f"Erro ao obter token: {response.status_code} - {response.text}")
-                    raise Exception(f"Erro ao obter token OAuth2: {response.status_code}")
+                    raise Exception(f"Erro OAuth2: {response.status_code}")
                     
         except Exception as e:
             logger.error(f"Erro ao obter token OAuth2: {e}")
             raise
     
-    async def get_token(self) -> str:
-        """Retorna token válido (usa cache se disponível)"""
-        if self._token and self._token_expires and datetime.now() < self._token_expires:
-            return self._token
-        
-        return await self._get_oauth_token()
-    
-    async def _make_request(
-        self, 
-        method: str, 
-        endpoint: str, 
-        **kwargs
-    ) -> Dict[str, Any]:
+    async def _make_request(self, endpoint: str) -> Dict[str, Any]:
         """Faz requisição para API do SERPRO"""
-        try:
-            token = await self.get_token()
-            url = f"{self.base_url}{endpoint}"
-            
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "User-Agent": "BotECAC/1.0",
-                "X-CPF-Procurador": self.cpf_procurador
-            }
-            
-            # Atualizar headers com os fornecidos
-            if "headers" in kwargs:
-                headers.update(kwargs.pop("headers"))
-            
-            logger.info(f"Fazendo requisição: {method} {url}")
-            
-            async with httpx.AsyncClient(
-                timeout=settings.request_timeout_seconds,
-                verify=self._ssl_context
-            ) as client:
-                response = await client.request(
-                    method=method,
-                    url=url,
-                    headers=headers,
-                    **kwargs
-                )
+        max_retries = settings.max_retries
+        
+        for attempt in range(max_retries):
+            try:
+                token = await self._get_oauth_token()
+                url = f"{self.base_url}{endpoint}"
                 
-                logger.info(f"Status response: {response.status_code}")
+                headers = {
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "BotECAC/1.0",
+                    "X-CPF-Procurador": self.cpf_procurador
+                }
                 
-                if response.status_code == 200:
-                    return response.json()
-                elif response.status_code == 401:
-                    # Token expirado, tentar renovar
-                    logger.warning("Token expirado, renovando...")
-                    self._token = None
-                    self._token_expires = None
-                    
-                    # Tentar novamente com novo token
-                    token = await self.get_token()
-                    headers["Authorization"] = f"Bearer {token}"
-                    
-                    response = await client.request(
-                        method=method,
-                        url=url,
-                        headers=headers,
-                        **kwargs
-                    )
+                logger.info(f"Tentativa {attempt + 1}: GET {url}")
+                
+                async with httpx.AsyncClient(
+                    timeout=settings.request_timeout_seconds,
+                    verify=self.ssl_context
+                ) as client:
+                    response = await client.get(url, headers=headers)
                     
                     if response.status_code == 200:
+                        logger.success(f"Consulta bem-sucedida: {endpoint}")
                         return response.json()
+                    elif response.status_code == 404:
+                        logger.warning(f"📋 API não encontrada: {endpoint} - Verifique se tem acesso ou se a procuração está válida")
+                        return {"status": "not_found", "error": "API não encontrada ou sem acesso", "data": None}
+                    elif response.status_code == 403:
+                        logger.error(f"🚫 ACESSO NEGADO: {endpoint} - Procuração pode estar EXPIRADA!")
+                        return {"status": "forbidden", "error": "Acesso negado - Procuração expirada", "data": None}
+                    elif response.status_code == 401:
+                        logger.warning("Token inválido, limpando cache...")
+                        token_cache.clear()
+                        if attempt < max_retries - 1:
+                            continue
+                        raise Exception("Erro de autenticação")
                     else:
-                        raise Exception(f"Erro após renovar token: {response.status_code} - {response.text}")
+                        logger.error(f"Erro API: {response.status_code} - {response.text}")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                            continue
+                        raise Exception(f"Erro API: {response.status_code}")
                         
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Tentativa {attempt + 1} falhou: {e}, tentando novamente...")
+                    await asyncio.sleep(2 ** attempt)
                 else:
-                    error_text = response.text
-                    logger.error(f"Erro na requisição: {response.status_code} - {error_text}")
-                    raise Exception(f"Erro na API SERPRO: {response.status_code} - {error_text}")
-                    
-        except Exception as e:
-            logger.error(f"Erro na requisição SERPRO: {e}")
-            raise
+                    logger.error(f"Todas as tentativas falharam para {endpoint}: {e}")
+                    raise
+        
+        raise Exception(f"Máximo de tentativas excedido para {endpoint}")
     
+    # Métodos de consulta específicos
     async def consultar_pgmei_divida_ativa(self, cnpj: str) -> Dict[str, Any]:
         """Consulta dívida ativa no PGMEI"""
-        endpoint = f"/pgmei/divida-ativa/{cnpj}"
-        return await self._make_request("GET", endpoint)
+        return await self._make_request(f"/pgmei/divida-ativa/{cnpj}")
     
-    async def consultar_pgdasd_declaracoes(self, cnpj: str, ano: Optional[int] = None) -> Dict[str, Any]:
+    async def consultar_pgdasd_declaracoes(self, cnpj: str) -> Dict[str, Any]:
         """Consulta declarações no PGDASD"""
-        endpoint = f"/pgdasd/declaracoes/{cnpj}"
-        if ano:
-            endpoint += f"?ano={ano}"
-        return await self._make_request("GET", endpoint)
+        return await self._make_request(f"/pgdasd/declaracoes/{cnpj}")
     
     async def consultar_ccmei_dados(self, cnpj: str) -> Dict[str, Any]:
         """Consulta dados do CCMEI"""
-        endpoint = f"/ccmei/dados/{cnpj}"
-        return await self._make_request("GET", endpoint)
+        return await self._make_request(f"/ccmei/dados/{cnpj}")
     
     async def consultar_ccmei_situacao_cadastral(self, cnpj: str) -> Dict[str, Any]:
         """Consulta situação cadastral no CCMEI"""
-        endpoint = f"/ccmei/situacao-cadastral/{cnpj}"
-        return await self._make_request("GET", endpoint)
+        return await self._make_request(f"/ccmei/situacao-cadastral/{cnpj}")
     
     async def consultar_caixa_postal(self, cnpj: str) -> Dict[str, Any]:
-        """Consulta caixa postal"""
-        endpoint = f"/caixa-postal/mensagens/{cnpj}"
-        return await self._make_request("GET", endpoint)
+        """Consulta mensagens do caixa postal"""
+        return await self._make_request(f"/caixa-postal/mensagens/{cnpj}")
     
     async def consultar_procuracoes(self, cnpj: str) -> Dict[str, Any]:
-        """Consulta procurações válidas"""
-        endpoint = f"/procuracoes/{cnpj}"
-        return await self._make_request("GET", endpoint)
+        """Consulta procurações ativas"""
+        return await self._make_request(f"/procuracoes/{cnpj}")
     
-    async def consultar_parcelamentos_mei(self, cnpj: str) -> Dict[str, Any]:
-        """Consulta parcelamentos MEI"""
-        endpoint = f"/parcmei/pedidos/{cnpj}"
-        return await self._make_request("GET", endpoint)
-    
-    async def consultar_parcelamentos_simples(self, cnpj: str) -> Dict[str, Any]:
-        """Consulta parcelamentos Simples Nacional"""
-        endpoint = f"/parcsn/pedidos/{cnpj}"
-        return await self._make_request("GET", endpoint)
-    
-    async def consultar_todas_informacoes(self, cnpj: str) -> Dict[str, Any]:
-        """Consulta todas as informações de um CNPJ"""
+    async def consultar_todas_apis(self, cnpj: str) -> Dict[str, Dict[str, Any]]:
+        """Consulta todas as APIs em paralelo"""
         logger.info(f"Iniciando consulta completa para CNPJ: {cnpj}")
         
-        resultados = {
-            "cnpj": cnpj,
-            "timestamp": datetime.now().isoformat(),
-            "consultas": {}
+        # Executar todas as consultas em paralelo
+        tasks = {
+            "pgmei_divida": self.consultar_pgmei_divida_ativa(cnpj),
+            "pgdasd_declaracoes": self.consultar_pgdasd_declaracoes(cnpj),
+            "ccmei_dados": self.consultar_ccmei_dados(cnpj),
+            "ccmei_situacao": self.consultar_ccmei_situacao_cadastral(cnpj),
+            "caixa_postal": self.consultar_caixa_postal(cnpj),
+            "procuracoes": self.consultar_procuracoes(cnpj)
         }
         
-        # Lista de consultas a serem feitas
-        consultas = [
-            ("pgmei_divida_ativa", self.consultar_pgmei_divida_ativa),
-            ("pgdasd_declaracoes", self.consultar_pgdasd_declaracoes),
-            ("ccmei_dados", self.consultar_ccmei_dados),
-            ("ccmei_situacao", self.consultar_ccmei_situacao_cadastral),
-            ("caixa_postal", self.consultar_caixa_postal),
-            ("procuracoes", self.consultar_procuracoes),
-            ("parcelamentos_mei", self.consultar_parcelamentos_mei),
-            ("parcelamentos_simples", self.consultar_parcelamentos_simples),
-        ]
-        
-        # Executar consultas
-        for nome, funcao in consultas:
+        resultados = {}
+        for nome, task in tasks.items():
             try:
-                logger.info(f"Consultando {nome}...")
-                resultado = await funcao(cnpj)
-                resultados["consultas"][nome] = {
-                    "success": True,
-                    "data": resultado
-                }
-                logger.info(f"Consulta {nome} concluída com sucesso")
-                
+                resultados[nome] = await task
+                logger.info(f"✅ {nome}: OK")
             except Exception as e:
-                logger.error(f"Erro na consulta {nome}: {e}")
-                resultados["consultas"][nome] = {
-                    "success": False,
-                    "error": str(e)
-                }
-                
-            # Pequena pausa entre requisições
-            await asyncio.sleep(0.5)
+                logger.error(f"❌ {nome}: {e}")
+                resultados[nome] = {"status": "error", "error": str(e)}
         
-        logger.info(f"Consulta completa finalizada para CNPJ: {cnpj}")
+        logger.success(f"Consulta completa finalizada para CNPJ: {cnpj}")
         return resultados
-    
-    async def health_check(self) -> Dict[str, Any]:
-        """Verifica se a API está funcionando"""
-        try:
-            token = await self.get_token()
-            return {
-                "status": "connected",
-                "token_obtido": True,
-                "timestamp": datetime.now().isoformat()
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "token_obtido": False,
-                "error": str(e),
-                "timestamp": datetime.now().isoformat()
-            }
 
 
 # Instância global do cliente
-serpro_client = SerproClient()
-
-
-def get_serpro_client() -> SerproClient:
-    """Retorna instância do cliente SERPRO"""
-    return serpro_client 
+serpro_client = SerproClient() 

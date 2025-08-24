@@ -1,521 +1,322 @@
-"""
-API Bot e-CAC - Aplicação Principal
-"""
-
-import uuid
-import time
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
 from datetime import datetime
 from decimal import Decimal
-from typing import Dict, Any
-from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from sqlalchemy.orm import Session
+from typing import List
+
+from app.config import settings
+from app.database import get_db, init_db
+from app.models import Haylander
+from app.schemas import (
+    CNPJRequest, 
+    HaylanderResponse, 
+    ConsultaResponse, 
+    HealthResponse
+)
+from app.serpro_client import serpro_client
+from app.token_cache import token_cache
+
 from loguru import logger
-
-from app.config import get_settings
-from app.models import (
-    ConsultaClienteRequest,
-    ConsultaClienteResponse, 
-    ErrorResponse,
-    HealthResponse,
-    StatusResponse,
-    DadosCliente,
-    DadosConsultados,
-    DadosMEI,
-    DadosCadastro,
-    DadosDividas,
-    DadosDeclaracoes,
-    DeclaracaoInfo,
-    ResumoConsulta,
-    AtividadePrincipal
-)
-from app.database import (
-    get_db, 
-    format_cnpj,
-    get_cliente_by_cnpj,
-    create_cliente,
-    update_cliente,
-    create_consulta_log,
-    Cliente,
-    ConsultaLog
-)
-from app.serpro_client import get_serpro_client, SerproClient
-from app.endpoints_n8n import router as n8n_router
-
-settings = get_settings()
-
-# Configuração da aplicação FastAPI
-app = FastAPI(
-    title=settings.api_title,
-    description=settings.api_description,
-    version=settings.api_version,
-    debug=settings.api_debug,
-    docs_url="/docs",
-    redoc_url="/redoc"
-)
-
-# Middleware CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=True,
-    allow_methods=settings.cors_methods,
-    allow_headers=["*"],
-)
-
-# Incluir routers
-app.include_router(n8n_router)
 
 # Configurar logging
 logger.add(
     settings.log_file,
+    level=settings.log_level,
     rotation="10 MB",
     retention="30 days",
-    level=settings.log_level,
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{function}:{line} | {message}"
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
 )
 
+# Criar aplicação FastAPI
+app = FastAPI(
+    title="Bot e-CAC - SERPRO Integra Contador",
+    description="Sistema simples para consultas automatizadas via SERPRO",
+    version="1.0.0",
+    debug=settings.api_debug
+)
 
-# Middleware para logging de requests
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    start_time = time.time()
-    
-    response = await call_next(request)
-    
-    process_time = time.time() - start_time
-    logger.info(
-        f"{request.method} {request.url.path} - "
-        f"Status: {response.status_code} - "
-        f"Time: {process_time:.4f}s"
-    )
-    
-    return response
+# Configurar CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-
-def create_error_response(
-    code: str, 
-    message: str, 
-    details: list = None,
-    request_id: str = None
-) -> ErrorResponse:
-    """Cria response de erro padronizado"""
-    return ErrorResponse(
-        error={
-            "code": code,
-            "message": message,
-            "details": details or []
-        },
-        timestamp=datetime.utcnow(),
-        request_id=request_id or str(uuid.uuid4())
-    )
+# Inicializar banco na startup
+@app.on_event("startup")
+def startup_event():
+    """Inicializar aplicação"""
+    logger.info("🚀 Iniciando Bot e-CAC...")
+    init_db()
+    logger.success("✅ Banco de dados inicializado")
+    logger.info("📋 ATENÇÃO: Verifique se a procuração SERPRO está válida!")
 
 
-def process_serpro_data(cnpj: str, serpro_data: Dict[str, Any]) -> DadosConsultados:
-    """Processa dados do SERPRO e converte para o formato da API"""
-    
-    # Dados MEI
-    mei_data = DadosMEI()
-    
-    # Processar PGMEI
-    if "pgmei_divida_ativa" in serpro_data.get("consultas", {}):
-        pgmei = serpro_data["consultas"]["pgmei_divida_ativa"]
-        if pgmei.get("success"):
-            data = pgmei.get("data", {})
-            if "data" in data:
-                dividas = data["data"].get("dividas", [])
-                valor_total = data["data"].get("valor_total_dividas", 0)
-                mei_data.valor_total_guias_abertas = Decimal(str(valor_total))
-    
-    # Processar CCMEI
-    if "ccmei_situacao" in serpro_data.get("consultas", {}):
-        ccmei = serpro_data["consultas"]["ccmei_situacao"]
-        if ccmei.get("success"):
-            data = ccmei.get("data", {})
-            if "data" in data:
-                situacao = data["data"].get("situacao", "")
-                mei_data.situacao = situacao
-                mei_data.is_mei = "MEI" in situacao.upper()
-    
-    # Processar PGDASD
-    declaracoes_pendentes = []
-    if "pgdasd_declaracoes" in serpro_data.get("consultas", {}):
-        pgdasd = serpro_data["consultas"]["pgdasd_declaracoes"]
-        if pgdasd.get("success"):
-            data = pgdasd.get("data", {})
-            if "data" in data:
-                declaracoes = data["data"].get("declaracoes", [])
-                for decl in declaracoes:
-                    if decl.get("situacao") == "PENDENTE":
-                        periodo = decl.get("periodo", "")
-                        if periodo and len(periodo) >= 4:
-                            ano = periodo[:4]
-                            if ano not in declaracoes_pendentes:
-                                declaracoes_pendentes.append(ano)
-    
-    mei_data.anos_declaracoes_pendentes = declaracoes_pendentes
-    
-    # Dados cadastrais (placeholder)
-    cadastro_data = DadosCadastro(
-        estado="SP",  # Será obtido de outras fontes
-        municipio="São Paulo",
-        atividade_principal=AtividadePrincipal(
-            codigo="6201-5/00",
-            descricao="Desenvolvimento de programas de computador sob encomenda"
-        ),
-        email="contato@exemplo.com"
-    )
-    
-    # Dados de dívidas
-    dividas_data = DadosDividas()
-    if mei_data.valor_total_guias_abertas:
-        dividas_data.divida_ativa_uniao = mei_data.valor_total_guias_abertas
-        dividas_data.total_dividas = mei_data.valor_total_guias_abertas
-    
-    # Dados de declarações
-    declaracoes_data = DadosDeclaracoes(
-        mei=DeclaracaoInfo(
-            possui=True,
-            anos_pendentes=declaracoes_pendentes
-        ),
-        simples_nacional=DeclaracaoInfo(
-            possui=True,
-            anos_pendentes=declaracoes_pendentes
-        )
-    )
-    
-    return DadosConsultados(
-        mei=mei_data,
-        cadastro=cadastro_data,
-        dividas=dividas_data,
-        declaracoes=declaracoes_data
-    )
-
-
-async def salvar_dados_cliente(
-    db: Session,
-    cnpj: str,
-    dados_request: ConsultaClienteRequest,
-    dados_consultados: DadosConsultados
-):
-    """Salva ou atualiza dados do cliente no banco"""
-    try:
-        # Buscar cliente existente
-        cliente = get_cliente_by_cnpj(db, cnpj)
-        
-        cliente_data = {
-            "cnpj": cnpj,
-            "cnpj_formatado": format_cnpj(cnpj),
-            "razao_social": dados_request.razao_social,
-            "is_mei": dados_consultados.mei.is_mei,
-            "situacao": dados_consultados.mei.situacao,
-            "estado": dados_consultados.cadastro.estado,
-            "municipio": dados_consultados.cadastro.municipio,
-            "email": dados_consultados.cadastro.email,
-            "telefone": dados_request.telefone,
-            "status_geral": "PENDENCIAS" if dados_consultados.mei.anos_declaracoes_pendentes else "OK",
-            "ultima_consulta": datetime.utcnow(),
-            "dados_completos": {
-                "mei": dados_consultados.mei.dict(),
-                "cadastro": dados_consultados.cadastro.dict(),
-                "dividas": dados_consultados.dividas.dict(),
-                "declaracoes": dados_consultados.declaracoes.dict() if dados_consultados.declaracoes else None
-            }
-        }
-        
-        if cliente:
-            update_cliente(db, cnpj, cliente_data)
-        else:
-            create_cliente(db, cliente_data)
-            
-        logger.info(f"Dados do cliente {cnpj} salvos no banco")
-        
-    except Exception as e:
-        logger.error(f"Erro ao salvar dados do cliente {cnpj}: {e}")
-
-
-def salvar_log_consulta(
-    db: Session,
-    request_id: str,
-    dados_request: ConsultaClienteRequest,
-    response_data: Dict[str, Any],
-    status: str,
-    tempo_resposta_ms: int,
-    request: Request,
-    error_log: Dict[str, Any] = None
-):
-    """Salva log da consulta no banco"""
-    try:
-        log_data = {
-            "request_id": request_id,
-            "cnpj": dados_request.cnpj,
-            "razao_social": dados_request.razao_social,
-            "nome_cliente": dados_request.nome,
-            "telefone": dados_request.telefone,
-            "data_consulta": datetime.utcnow(),
-            "status": status,
-            "tempo_resposta_ms": tempo_resposta_ms,
-            "ip_origem": request.client.host if request.client else None,
-            "user_agent": request.headers.get("user-agent"),
-            "dados_request": dados_request.dict(),
-            "dados_response": response_data,
-            "errors_log": error_log
-        }
-        
-        create_consulta_log(db, log_data)
-        logger.info(f"Log da consulta {request_id} salvo")
-        
-    except Exception as e:
-        logger.error(f"Erro ao salvar log da consulta {request_id}: {e}")
-
-
-# Endpoints da API
-
-@app.get("/", include_in_schema=False)
+@app.get("/", response_model=dict)
 async def root():
     """Endpoint raiz"""
     return {
-        "message": "Bot e-CAC API",
-        "version": settings.api_version,
-        "docs": "/docs"
+        "message": "🤖 Bot e-CAC - SERPRO Integra Contador",
+        "version": "1.0.0",
+        "status": "✅ Sistema operacional",
+        "ambiente": settings.serpro_ambiente,
+        "endpoints": {
+            "docs": "/docs",
+            "health": "/health",
+            "consultar": "/consultar/{cnpj}",
+            "listar": "/clientes"
+        },
+        "importante": "⚠️ Verifique se a procuração SERPRO está válida"
     }
 
 
 @app.get("/health", response_model=HealthResponse)
-async def health_check(
-    serpro_client: SerproClient = Depends(get_serpro_client),
-    db: Session = Depends(get_db)
-):
-    """Health check da API"""
-    
-    # Verificar SERPRO
-    serpro_status = await serpro_client.health_check()
-    
-    # Verificar banco de dados
+async def health_check(db: Session = Depends(get_db)):
+    """Health check da aplicação"""
     try:
-        db.execute("SELECT 1")
-        db_status = "connected"
+        # Testar conexão com banco usando SQLAlchemy 2.0+ syntax
+        from sqlalchemy import text
+        result = db.execute(text("SELECT 1")).fetchone()
+        if result and result[0] == 1:
+            db_status = "connected"
+        else:
+            db_status = "error"
     except Exception as e:
-        db_status = f"error: {str(e)}"
+        logger.error(f"Erro no health check do banco: {e}")
+        db_status = "error"
+    
+    # Verificar cache de token
+    cache_status = "ok" if token_cache.get_token() else "empty"
     
     return HealthResponse(
-        status="healthy" if serpro_status["status"] == "connected" and db_status == "connected" else "unhealthy",
-        integra_contador=serpro_status["status"],
+        timestamp=datetime.now(),
         database=db_status,
-        timestamp=datetime.utcnow(),
-        version=settings.api_version
+        serpro_cache=cache_status
     )
 
 
-@app.get("/status/{cnpj}", response_model=StatusResponse)
-async def consultar_status_rapido(
-    cnpj: str,
+def consolidar_dados_serpro(cnpj: str, dados_apis: dict) -> dict:
+    """Consolida dados das APIs SERPRO em estrutura simples"""
+    
+    # Extrair dados PGMEI
+    pgmei_data = dados_apis.get("pgmei_divida", {})
+    pgmei_valor = 0.00
+    pgmei_tem_divida = False
+    
+    if pgmei_data.get("status") != "error" and pgmei_data.get("status") != "not_found":
+        # Processar dados de dívida (estrutura pode variar)
+        dividas = pgmei_data.get("dividas", [])
+        if dividas:
+            pgmei_valor = sum(float(d.get("valor", 0)) for d in dividas)
+            pgmei_tem_divida = pgmei_valor > 0
+    
+    # Extrair dados PGDASD
+    pgdasd_data = dados_apis.get("pgdasd_declaracoes", {})
+    pgdasd_count = 0
+    pgdasd_anos = ""
+    
+    if pgdasd_data.get("status") != "error" and pgdasd_data.get("status") != "not_found":
+        declaracoes = pgdasd_data.get("declaracoes_pendentes", [])
+        pgdasd_count = len(declaracoes)
+        anos_list = [str(d.get("ano", "")) for d in declaracoes if d.get("ano")]
+        pgdasd_anos = ",".join(anos_list)
+    
+    # Extrair dados CCMEI
+    ccmei_data = dados_apis.get("ccmei_dados", {}) or dados_apis.get("ccmei_situacao", {})
+    ccmei_situacao = "Não informada"
+    ccmei_abertura = None
+    
+    if ccmei_data.get("status") != "error" and ccmei_data.get("status") != "not_found":
+        ccmei_situacao = ccmei_data.get("situacao", "Ativa")
+        abertura_str = ccmei_data.get("data_abertura")
+        if abertura_str:
+            try:
+                ccmei_abertura = datetime.fromisoformat(abertura_str.replace("Z", "+00:00"))
+            except:
+                pass
+    
+    # Extrair dados Caixa Postal
+    caixa_data = dados_apis.get("caixa_postal", {})
+    caixa_count = 0
+    caixa_nao_lidas = 0
+    
+    if caixa_data.get("status") != "error" and caixa_data.get("status") != "not_found":
+        mensagens = caixa_data.get("mensagens", [])
+        caixa_count = len(mensagens)
+        caixa_nao_lidas = len([m for m in mensagens if not m.get("lida", True)])
+    
+    # Extrair dados Procurações
+    proc_data = dados_apis.get("procuracoes", {})
+    proc_ativas = 0
+    
+    if proc_data.get("status") != "error" and proc_data.get("status") != "not_found":
+        procuracoes = proc_data.get("procuracoes", [])
+        proc_ativas = len([p for p in procuracoes if p.get("ativa", False)])
+    
+    # Calcular situação geral
+    valor_total = pgmei_valor
+    situacao_geral = "OK"
+    
+    if pgmei_tem_divida or pgdasd_count > 0 or caixa_nao_lidas > 0:
+        situacao_geral = "PENDENCIAS"
+    
+    if pgmei_valor > 1000 or pgdasd_count > 3:
+        situacao_geral = "PROBLEMAS"
+    
+    return {
+        "pgmei_divida_valor": Decimal(str(pgmei_valor)),
+        "pgmei_tem_divida": pgmei_tem_divida,
+        "pgmei_ultimo_update": datetime.now(),
+        
+        "pgdasd_pendentes_count": pgdasd_count,
+        "pgdasd_anos_pendentes": pgdasd_anos,
+        "pgdasd_ultimo_update": datetime.now(),
+        
+        "ccmei_situacao": ccmei_situacao,
+        "ccmei_data_abertura": ccmei_abertura,
+        "ccmei_ultimo_update": datetime.now(),
+        
+        "caixa_mensagens_count": caixa_count,
+        "caixa_mensagens_nao_lidas": caixa_nao_lidas,
+        "caixa_ultimo_update": datetime.now(),
+        
+        "procuracoes_ativas": proc_ativas,
+        "procuracoes_ultimo_update": datetime.now(),
+        
+        "situacao_geral": situacao_geral,
+        "valor_total_pendente": Decimal(str(valor_total)),
+        "ultima_consulta": datetime.now(),
+        "status_consulta": "SUCCESS"
+    }
+
+
+@app.post("/consultar/{cnpj}", response_model=ConsultaResponse)
+async def consultar_cliente(
+    cnpj: str, 
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
-    """Consulta status rápido de um CNPJ"""
+    """Consulta completa de um cliente via SERPRO"""
     
-    # Buscar no banco
-    cliente = get_cliente_by_cnpj(db, cnpj)
-    
-    if not cliente:
-        raise HTTPException(
-            status_code=404,
-            detail="CNPJ não encontrado na base de dados"
-        )
-    
-    return StatusResponse(
-        cnpj=cnpj,
-        is_mei=cliente.is_mei,
-        situacao=cliente.situacao or "DESCONHECIDO",
-        tem_pendencias=cliente.status_geral == "PENDENCIAS"
-    )
-
-
-@app.post("/api/v1/consultar-cliente", response_model=ConsultaClienteResponse)
-async def consultar_cliente(
-    dados_request: ConsultaClienteRequest,
-    background_tasks: BackgroundTasks,
-    request: Request,
-    db: Session = Depends(get_db),
-    serpro_client: SerproClient = Depends(get_serpro_client)
-):
-    """Endpoint principal - Consulta dados do cliente no e-CAC"""
-    
-    start_time = time.time()
-    request_id = str(uuid.uuid4())
-    
-    logger.info(f"Iniciando consulta {request_id} para CNPJ: {dados_request.cnpj}")
+    # Validar CNPJ
+    cnpj_limpo = ''.join(filter(str.isdigit, cnpj))
+    if len(cnpj_limpo) != 14:
+        raise HTTPException(status_code=400, detail="CNPJ deve ter 14 dígitos")
     
     try:
-        # Consultar dados no SERPRO
-        serpro_data = await serpro_client.consultar_todas_informacoes(dados_request.cnpj)
+        logger.info(f"🔍 Iniciando consulta para CNPJ: {cnpj_limpo}")
         
-        # Processar dados recebidos
-        dados_consultados = process_serpro_data(dados_request.cnpj, serpro_data)
+        # Consultar todas as APIs SERPRO
+        dados_apis = await serpro_client.consultar_todas_apis(cnpj_limpo)
         
-        # Criar response
-        dados_cliente = DadosCliente(
-            cnpj=dados_request.cnpj,
-            cnpj_formatado=format_cnpj(dados_request.cnpj),
-            razao_social=dados_request.razao_social,
-            nome=dados_request.nome,
-            telefone=dados_request.telefone
+        # Consolidar dados
+        dados_consolidados = consolidar_dados_serpro(cnpj_limpo, dados_apis)
+        
+        # Buscar ou criar registro na tabela
+        cliente = db.query(Haylander).filter(Haylander.cnpj == cnpj_limpo).first()
+        
+        if cliente:
+            # Atualizar registro existente
+            for campo, valor in dados_consolidados.items():
+                setattr(cliente, campo, valor)
+            cliente.updated_at = datetime.now()
+        else:
+            # Criar novo registro
+            dados_consolidados["cnpj"] = cnpj_limpo
+            dados_consolidados["created_at"] = datetime.now()
+            cliente = Haylander(**dados_consolidados)
+            db.add(cliente)
+        
+        db.commit()
+        db.refresh(cliente)
+        
+        logger.success(f"✅ Consulta finalizada para CNPJ: {cnpj_limpo}")
+        
+        return ConsultaResponse(
+            success=True,
+            message="✅ Consulta realizada com sucesso",
+            cnpj=cnpj_limpo,
+            dados=HaylanderResponse.from_orm(cliente)
         )
-        
-        # Criar resumo
-        total_devido = dados_consultados.dividas.total_dividas
-        acoes_necessarias = []
-        
-        if dados_consultados.mei.anos_declaracoes_pendentes:
-            anos_str = ", ".join(dados_consultados.mei.anos_declaracoes_pendentes)
-            acoes_necessarias.append(f"Regularizar declarações MEI {anos_str}")
-        
-        if total_devido > 0:
-            acoes_necessarias.append("Quitar guias em aberto")
-        
-        status_geral = "PENDENCIAS" if acoes_necessarias else "OK"
-        
-        resumo = ResumoConsulta(
-            status_geral=status_geral,
-            total_devido=total_devido,
-            acoes_necessarias=acoes_necessarias
-        )
-        
-        response = ConsultaClienteResponse(
-            timestamp=datetime.utcnow(),
-            request_id=request_id,
-            dados_cliente=dados_cliente,
-            dados_consultados=dados_consultados,
-            resumo=resumo
-        )
-        
-        # Salvar dados em background
-        tempo_resposta_ms = int((time.time() - start_time) * 1000)
-        
-        background_tasks.add_task(
-            salvar_dados_cliente,
-            db, dados_request.cnpj, dados_request, dados_consultados
-        )
-        
-        background_tasks.add_task(
-            salvar_log_consulta,
-            db, request_id, dados_request, response.dict(),
-            "SUCCESS", tempo_resposta_ms, request
-        )
-        
-        logger.info(f"Consulta {request_id} concluída com sucesso")
-        return response
         
     except Exception as e:
-        logger.error(f"Erro na consulta {request_id}: {e}")
+        error_msg = str(e)
         
-        # Salvar erro em background
-        tempo_resposta_ms = int((time.time() - start_time) * 1000)
-        
-        background_tasks.add_task(
-            salvar_log_consulta,
-            db, request_id, dados_request, {},
-            "ERROR", tempo_resposta_ms, request, {"error": str(e)}
-        )
-        
-        # Retornar erro apropriado
-        if "401" in str(e) or "token" in str(e).lower():
-            raise HTTPException(
-                status_code=401,
-                detail="Erro de autenticação com SERPRO"
-            )
-        elif "404" in str(e):
-            raise HTTPException(
-                status_code=404,
-                detail="CNPJ não encontrado"
-            )
-        elif "timeout" in str(e).lower():
-            raise HTTPException(
-                status_code=503,
-                detail="Timeout na consulta ao SERPRO"
-            )
+        # Detectar se é erro de procuração
+        if "403" in error_msg or "forbidden" in error_msg.lower():
+            logger.error(f"🚫 PROCURAÇÃO EXPIRADA para CNPJ {cnpj_limpo}: {e}")
+            error_detail = "Procuração SERPRO expirada - Renovar procuração"
+        elif "404" in error_msg or "not found" in error_msg.lower():
+            logger.error(f"📋 API não encontrada para CNPJ {cnpj_limpo}: {e}")
+            error_detail = "API não encontrada - Verificar acesso SERPRO"
         else:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Erro interno: {str(e)}"
-            )
-
-
-@app.post("/api/v1/consultar-teste")
-async def consultar_teste():
-    """Endpoint de teste com dados fictícios"""
-    
-    request_id = str(uuid.uuid4())
-    
-    # Dados fictícios para teste
-    dados_cliente = DadosCliente(
-        cnpj=settings.cnpj_teste,
-        cnpj_formatado=format_cnpj(settings.cnpj_teste),
-        razao_social=settings.razao_social_teste,
-        nome="Gustavo Souza",
-        telefone="11999887766"
-    )
-    
-    dados_consultados = DadosConsultados(
-        mei=DadosMEI(
-            is_mei=True,
-            situacao="ATIVO",
-            valor_total_guias_abertas=Decimal("245.40"),
-            anos_declaracoes_pendentes=["2023", "2024"]
-        ),
-        cadastro=DadosCadastro(
-            estado="SP",
-            municipio="São Paulo",
-            atividade_principal=AtividadePrincipal(
-                codigo="6201-5/00",
-                descricao="Desenvolvimento de programas de computador sob encomenda"
-            ),
-            email="gustavo@exemplo.com"
-        ),
-        dividas=DadosDividas(
-            divida_ativa_uniao=Decimal("245.40"),
-            total_dividas=Decimal("245.40")
-        ),
-        declaracoes=DadosDeclaracoes(
-            mei=DeclaracaoInfo(
-                possui=True,
-                anos_pendentes=["2023", "2024"]
-            )
+            logger.error(f"❌ Erro na consulta para CNPJ {cnpj_limpo}: {e}")
+            error_detail = f"Erro interno: {error_msg}"
+        
+        # Tentar salvar erro na base
+        try:
+            cliente = db.query(Haylander).filter(Haylander.cnpj == cnpj_limpo).first()
+            if cliente:
+                cliente.status_consulta = "ERROR"
+                cliente.ultima_consulta = datetime.now()
+                db.commit()
+        except:
+            pass
+        
+        return ConsultaResponse(
+            success=False,
+            message=error_detail,
+            cnpj=cnpj_limpo,
+            errors=[error_detail]
         )
-    )
-    
-    resumo = ResumoConsulta(
-        status_geral="PENDENCIAS",
-        total_devido=Decimal("245.40"),
-        acoes_necessarias=[
-            "Regularizar declarações MEI 2023 e 2024",
-            "Quitar guias em aberto"
-        ]
-    )
-    
-    return ConsultaClienteResponse(
-        timestamp=datetime.utcnow(),
-        request_id=request_id,
-        dados_cliente=dados_cliente,
-        dados_consultados=dados_consultados,
-        resumo=resumo
-    )
 
 
-# Handler global de erros
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Erro não tratado: {exc}")
+@app.get("/cliente/{cnpj}", response_model=HaylanderResponse)
+async def obter_dados_cliente(cnpj: str, db: Session = Depends(get_db)):
+    """Obtém dados consolidados de um cliente"""
     
-    return JSONResponse(
-        status_code=500,
-        content=create_error_response(
-            "INTERNAL_ERROR",
-            "Erro interno do servidor",
-            [str(exc)]
-        ).dict()
-    )
+    cnpj_limpo = ''.join(filter(str.isdigit, cnpj))
+    if len(cnpj_limpo) != 14:
+        raise HTTPException(status_code=400, detail="CNPJ deve ter 14 dígitos")
+    
+    cliente = db.query(Haylander).filter(Haylander.cnpj == cnpj_limpo).first()
+    
+    if not cliente:
+        raise HTTPException(status_code=404, detail="Cliente não encontrado")
+    
+    return HaylanderResponse.from_orm(cliente)
+
+
+@app.get("/clientes", response_model=List[HaylanderResponse])
+async def listar_clientes(
+    limit: int = 50, 
+    offset: int = 0, 
+    db: Session = Depends(get_db)
+):
+    """Lista todos os clientes com paginação"""
+    
+    clientes = db.query(Haylander).offset(offset).limit(limit).all()
+    
+    return [HaylanderResponse.from_orm(cliente) for cliente in clientes]
+
+
+@app.delete("/cliente/{cnpj}")
+async def deletar_cliente(cnpj: str, db: Session = Depends(get_db)):
+    """Remove um cliente da base"""
+    
+    cnpj_limpo = ''.join(filter(str.isdigit, cnpj))
+    cliente = db.query(Haylander).filter(Haylander.cnpj == cnpj_limpo).first()
+    
+    if not cliente:
+        raise HTTPException(status_code=404, detail="Cliente não encontrado")
+    
+    db.delete(cliente)
+    db.commit()
+    
+    return {"message": "Cliente removido com sucesso"}
 
 
 if __name__ == "__main__":
